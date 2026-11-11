@@ -1,0 +1,871 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- viewport: no user zoom lock, mobile-safe area for phones with a notch -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#10231a">
+<!-- inline favicon: keeps a stray favicon.ico request out of the network log -->
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🍂</text></svg>">
+<title>Leaf classifier — live camera</title>
+
+<!--
+  Leaf classifier — one self-contained page, plain HTML + CSS + JavaScript.
+
+  model_info.json ->  {"classes": [...], "input_size": 96,
+                       "mean": [...], "std": [...]}
+  leaf_model.onnx ->  input  "image"  float32 [1, 3, 96, 96]   (NCHW)
+                      output "logits" float32 [1, 4]           (NO softmax inside)
+
+  Preprocessing mirrors the notebook exactly:
+      transforms.ToTensor()    -> pixels / 255, (H, W, 3) -> (3, H, W)
+      transforms.Normalize()   -> (x - mean) / std, per channel
+  The ONNX graph ends in a plain Linear layer, so the softmax of the reference
+  cell (model(x).softmax(dim=1)) is applied here, in softmax().
+
+  Privacy: the camera frames and every uploaded photo stay in this page.
+  Nothing is ever uploaded — only the library scripts are downloaded.
+-->
+
+<style>
+  :root {
+    --bg:      #0f1a14;
+    --panel:   #16261d;
+    --panel-2: #1d3125;
+    --line:    #2b4436;
+    --text:    #e8f2ec;
+    --muted:   #9db4a7;
+    --accent:  #6ee7a8;
+    --accent-2:#3ddc97;
+    --warn:    #ffcf6b;
+    --bad:     #ff8a8a;
+    --radius:  14px;
+  }
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    padding: 0 env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-text-size-adjust: 100%;
+  }
+  main { max-width: 620px; margin: 0 auto; padding: 18px 16px 56px; }
+
+  h1 { font-size: 1.35rem; margin: 0 0 4px; letter-spacing: .2px; }
+  h2 { font-size: 1.02rem; margin: 0 0 10px; font-weight: 600; color: var(--accent); }
+  p.sub { margin: 0 0 18px; color: var(--muted); font-size: .9rem; }
+  section {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+
+  /* ---------- video ---------- */
+  .stage {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    background: #000;
+    border-radius: 12px;
+    overflow: hidden;
+    display: flex; align-items: center; justify-content: center;
+  }
+  video, .stage img.preview {
+    width: 100%; height: 100%;
+    object-fit: cover;
+    display: block;
+    background: #000;
+  }
+  /* the square actually seen by the model = the central square of the frame */
+  .cropbox {
+    position: absolute; left: 50%; top: 50%;
+    width: min(100%, 100%); aspect-ratio: 1/1;
+    transform: translate(-50%, -50%);
+    border: 2px dashed rgba(110,231,168,.75);
+    border-radius: 6px;
+    pointer-events: none;
+  }
+  .cropbox span {
+    position: absolute; top: 6px; left: 50%; transform: translateX(-50%);
+    font-size: .62rem; letter-spacing: .12em; text-transform: uppercase;
+    color: rgba(255,255,255,.8); text-shadow: 0 1px 3px #000; white-space: nowrap;
+  }
+  .hint {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 8px; color: var(--muted); font-size: .88rem; text-align: center; padding: 20px;
+  }
+
+  .top1 {
+    margin: 12px 0 4px;
+    display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  }
+  .top1 .name { font-size: 1.7rem; font-weight: 700; color: var(--accent); line-height: 1.1; }
+  .top1 .pct  { font-size: 1.15rem; color: var(--text); font-variant-numeric: tabular-nums; }
+  .meta { color: var(--muted); font-size: .78rem; font-variant-numeric: tabular-nums; }
+
+  /* ---------- probability bars ---------- */
+  ul.bars { list-style: none; margin: 14px 0 0; padding: 0; }
+  ul.bars li { margin-bottom: 10px; }
+  .row1 { display: flex; justify-content: space-between; font-size: .9rem; margin-bottom: 4px; }
+  .row1 .label { text-transform: capitalize; }
+  .row1 .value { font-variant-numeric: tabular-nums; color: var(--muted); }
+  li.lead .row1 .label { color: var(--accent); font-weight: 600; }
+  li.lead .row1 .value { color: var(--accent); }
+  .track { height: 10px; background: var(--panel-2); border-radius: 999px; overflow: hidden; }
+  .fill {
+    height: 100%; width: 0%;
+    background: linear-gradient(90deg, var(--accent-2), #a7f3d0);
+    border-radius: 999px;
+    transition: width .16s linear;
+  }
+
+  /* ---------- controls ---------- */
+  .controls { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+  button, .filelabel {
+    appearance: none; -webkit-appearance: none;
+    font: inherit; font-size: .95rem;
+    padding: 11px 16px; border-radius: 10px;
+    border: 1px solid var(--line);
+    background: var(--panel-2); color: var(--text);
+    cursor: pointer;
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  }
+  button.primary, .filelabel {
+    background: var(--accent-2); border-color: var(--accent-2); color: #06281a; font-weight: 650;
+  }
+  button:active { transform: translateY(1px); }
+  button:disabled { opacity: .5; cursor: default; }
+  input[type=file] { position: absolute; width: 1px; height: 1px; opacity: 0; overflow: hidden; }
+
+  input[type=url], input[type=text] {
+    font: inherit; width: 100%;
+    padding: 11px 12px; border-radius: 10px;
+    border: 1px solid var(--line); background: #10201a; color: var(--text);
+  }
+  input:focus, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  /* ---------- status ---------- */
+  #status { font-size: .86rem; }
+  #status .line { display: block; margin-bottom: 5px; }
+  #status .ok   { color: var(--accent); }
+  #status .warn { color: var(--warn); }
+  #status .bad  { color: var(--bad); }
+
+  /* ---------- self-check table ---------- */
+  table { width: 100%; border-collapse: collapse; font-size: .84rem; }
+  th, td { text-align: right; padding: 6px 4px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--muted); font-weight: 500; }
+  caption { caption-side: top; text-align: left; color: var(--muted); font-size: .82rem; padding-bottom: 8px; }
+  .verdict { margin-top: 10px; font-size: .9rem; font-weight: 600; }
+  .verdict.ok { color: var(--accent); }
+  .verdict.bad { color: var(--bad); }
+
+  /* ---------- QR ---------- */
+  .qr { display: flex; gap: 18px; align-items: flex-start; flex-wrap: wrap; margin-top: 14px; }
+  #qrcode {
+    background: #fff; padding: 10px; border-radius: 10px; line-height: 0;
+    min-width: 150px; min-height: 150px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #qrcode img, #qrcode canvas, #qrcode svg { display: block; image-rendering: pixelated; }
+  .qrside { flex: 1 1 220px; min-width: 200px; }
+  a.pageurl { color: var(--accent); word-break: break-all; font-size: .92rem; }
+  small.note { color: var(--muted); font-size: .78rem; display: block; margin-top: 10px; }
+  code { background: #10201a; padding: 1px 5px; border-radius: 5px; font-size: .85em; }
+  .hidden { display: none !important; }
+</style>
+</head>
+
+<body>
+<main>
+  <h1>🍂 Leaf classifier</h1>
+  <p class="sub">
+    MobileNetV3&#8209;small, exported to ONNX, running entirely in this browser —
+    <strong>nothing leaves your phone</strong>.
+  </p>
+
+  <!-- ============================ CAMERA ============================ -->
+  <section>
+    <h2>Live camera</h2>
+
+    <div class="stage">
+      <!-- iOS Safari needs playsinline (both spellings) + muted + autoplay,
+           otherwise it hijacks the stream into fullscreen native playback. -->
+      <video id="video" autoplay muted playsinline webkit-playsinline
+             x-webkit-airplay="deny" disablepictureinpicture></video>
+      <div class="cropbox hidden" id="cropbox"><span>what the model sees</span></div>
+      <div class="hint" id="camHint">Point the rear camera at a leaf.<br>
+        <span class="meta">The camera only starts after you press Start, and only over HTTPS.</span>
+      </div>
+    </div>
+
+    <div class="top1">
+      <span class="name" id="topName">—</span>
+      <span class="pct" id="topPct"></span>
+    </div>
+    <div class="meta" id="perf"></div>
+
+    <ul class="bars" id="bars"></ul>
+
+    <div class="controls">
+      <button id="startBtn" class="primary">▶ Start camera</button>
+      <button id="stopBtn" class="hidden">■ Stop</button>
+      <label class="filelabel" for="fileInput">📷 Upload a photo</label>
+      <input type="file" id="fileInput" accept="image/*">
+    </div>
+    <p class="meta" id="privacyNote">
+      Frames are drawn to a hidden canvas and read back locally — no image,
+      no prediction and no telemetry is ever sent anywhere.
+    </p>
+  </section>
+
+  <!-- ======================= OFFLINE SELF-CHECK ======================= -->
+  <section>
+    <h2>Offline check <span class="meta">(same model, same preprocessing, no camera)</span></h2>
+    <p class="sub" style="margin-bottom:10px">
+      <code>check_image.jpg</code> is classified here and compared with
+      <code>check_expected.json</code> from the notebook. Uploading that same file
+      above runs the identical path.
+    </p>
+    <div id="selfcheck">
+      <p class="meta">Waiting for the model…</p>
+    </div>
+    <div class="controls">
+      <button id="checkBtn" disabled>↻ Run the check again</button>
+    </div>
+  </section>
+
+  <!-- ============================ STATUS ============================ -->
+  <section>
+    <h2>Status</h2>
+    <div id="status"><span class="line">Loading the runtime…</span></div>
+  </section>
+
+  <!-- ============================ QR CODE ============================ -->
+  <section>
+    <h2>Open it on a phone</h2>
+    <p class="sub" style="margin-bottom:10px">
+      The address box is filled with the URL of this page, so as soon as it is
+      pushed to GitHub Pages the QR code below already points at the live app.
+      Generated locally by <code>qrcode.js</code> — no external QR image service.
+    </p>
+
+    <label for="urlInput" class="meta">Encoded address</label>
+    <input id="urlInput" type="url" autocomplete="off" spellcheck="false"
+           placeholder="https://<user>.github.io/mlr-ex08/">
+
+    <div class="controls">
+      <button id="useCurrentBtn">Use this page’s URL</button>
+      <button id="copyBtn">Copy link</button>
+    </div>
+
+    <div class="qr">
+      <div id="qrcode" aria-label="QR code of the page URL"></div>
+      <div class="qrside">
+        <a id="urlLink" class="pageurl" href="#" rel="me">—</a>
+        <small class="note" id="qrNote">Scan with the phone’s camera app.</small>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- worker that only ever talks to this page (no network), keeps ORT off the UI thread -->
+<script>
+"use strict";
+
+/* =====================================================================
+   0.  Configuration — everything readable comes from model_info.json
+   ===================================================================== */
+
+// Defaults, identical to model_info.json; the real file is loaded and wins if present.
+let INFO = {
+  classes:    ["apple", "cherry", "chestnut", "maple"],
+  input_size: 96,
+  mean:       [0.485, 0.456, 0.406],
+  std:        [0.229, 0.224, 0.225]
+};
+
+const MODEL_FILE   = "leaf_model.onnx";
+const INFO_FILE    = "model_info.json";
+const CHECK_IMAGE  = "check_image.jpg";
+const CHECK_JSON   = "check_expected.json";
+
+// onnxruntime-web, newest first; the first one that loads is used.
+const ORT_CANDIDATES = [
+  "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/ort.min.js",
+  "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.1/dist/ort.min.js",
+  "https://cdnjs.cloudflare.com/ajax/libs/onnxruntime-web/1.18.1/ort.min.js"
+];
+const QR_CANDIDATES = [
+  "https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js",
+  "https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"
+];
+
+/* =====================================================================
+   1.  Small helpers
+   ===================================================================== */
+
+const $ = (id) => document.getElementById(id);
+
+function log(msg, kind) {
+  const box = $("status");
+  const line = document.createElement("span");
+  line.className = "line " + (kind || "");
+  line.textContent = msg;
+  box.appendChild(line);
+  while (box.childElementCount > 14) box.removeChild(box.firstChild);
+  console.log("[" + (kind || "info") + "]", msg);
+}
+
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = src;
+    s.async = true;
+    s.onload  = () => resolve(src);
+    s.onerror = () => reject(new Error("could not load " + src));
+    document.head.appendChild(s);
+  });
+}
+
+async function loadFirst(candidates, label) {
+  for (const src of candidates) {
+    try {
+      await loadScript(src);
+      log(label + " loaded from " + new URL(src).host, "ok");
+      return src;
+    } catch (e) {
+      log(label + " failed on " + new URL(src).host + ", trying the next mirror…", "warn");
+    }
+  }
+  throw new Error("Could not load " + label + " from any CDN — is the phone online?");
+}
+
+const url = (file) => new URL(file, document.baseURI).href;
+
+/* =====================================================================
+   2.  Model
+   ===================================================================== */
+
+let session = null;
+let INPUT_NAME = "image";
+
+async function loadModelInfo() {
+  try {
+    const r = await fetch(url(INFO_FILE), { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const info = await r.json();
+    if (info.classes) INFO.classes = info.classes;
+    if (info.input_size) INFO.input_size = info.input_size | 0;
+    if (info.mean) INFO.mean = info.mean;
+    if (info.std) INFO.std = info.std;
+    log("model_info.json: " + INFO.input_size + "×" + INFO.input_size +
+        ", mean " + INFO.mean.join(", ") + ", std " + INFO.std.join(", "), "ok");
+  } catch (e) {
+    log("model_info.json not reachable (" + e.message +
+        ") — using the built-in copy of the same values.", "warn");
+  }
+}
+
+async function loadModel() {
+  const ortUrl = await loadFirst(ORT_CANDIDATES, "onnxruntime-web");
+
+  // iOS Safari + GitHub Pages: no cross-origin isolation headers, so
+  // SharedArrayBuffer/threads are unavailable there. Pin to a single thread
+  // and to no worker proxy — the plain main-thread WASM build is the one
+  // that reliably runs on iPhone Safari.
+  ort.env.wasm.numThreads = 1;
+  ort.env.wasm.proxy      = false;
+  ort.env.wasm.wasmPaths  = ortUrl.slice(0, ortUrl.lastIndexOf("/") + 1);
+
+  const modelURL = url(MODEL_FILE);
+  try {
+    session = await ort.InferenceSession.create(modelURL, {
+      graphOptimizationLevel: "all",
+      executionProviders: ["wasm"]
+    });
+  } catch (e) {
+    log("Graph optimisation 'all' failed (" + e.message + "), retrying with 'basic'…", "warn");
+    session = await ort.InferenceSession.create(modelURL, {
+      graphOptimizationLevel: "basic",
+      executionProviders: ["wasm"]
+    });
+  }
+
+  INPUT_NAME = session.inputNames[0];        // "image"
+  // Input metadata is exposed differently across onnxruntime-web versions,
+  // so read it defensively and never let the report line break the start-up.
+  let dims = [1, 3, INFO.input_size, INFO.input_size];
+  try {
+    const meta = session.inputMetadata && session.inputMetadata[INPUT_NAME];
+    if (meta && meta.dimensions && meta.dimensions.length) dims = meta.dimensions;
+  } catch (e) { /* keep the expected shape */ }
+  log("Model ready — input '" + INPUT_NAME + "' [" + dims.join(", ") +
+      "], output '" + session.outputNames[0] + "' (" + INFO.classes.length + " classes)", "ok");
+}
+
+/* =====================================================================
+   3.  PREPROCESSING — the part to read for the report
+   ---------------------------------------------------------------------
+   source pixels  ->  Float32Array of shape 1 x 3 x size x size (NCHW)
+
+     1. crop the CENTRAL SQUARE of the frame            (side = min(W, H))
+     2. resize that square to input_size x input_size   (canvas, high quality)
+     3. read the RGBA bytes, divide R, G, B by 255      (ToTensor)
+     4. standardise each channel: (x - mean) / std      (Normalize)
+     5. write them channel-first: plane 0 = R, 1 = G, 2 = B   (NCHW)
+   ===================================================================== */
+
+const cropCanvas = document.createElement("canvas");   // optional intermediate step
+const srcCanvas  = document.createElement("canvas");   // the size x size canvas read back
+let   srcCtx     = null;
+
+function preprocess(source, sourceW, sourceH) {
+  const size = INFO.input_size;
+
+  // ---- 1. central square ------------------------------------------------
+  const side = Math.min(sourceW, sourceH);
+  const sx = Math.round((sourceW - side) / 2);
+  const sy = Math.round((sourceH - side) / 2);
+
+  if (!srcCtx) {
+    srcCanvas.width = srcCanvas.height = size;
+    srcCtx = srcCanvas.getContext("2d", { willReadFrequently: true });
+  }
+
+  // ---- 2. resize --------------------------------------------------------
+  // Downscaling far in one step aliases badly, so very large sources are
+  // first halved into an intermediate canvas. When the source is *already*
+  // size x size (check_image.jpg is exactly 96 x 96) the copy is 1:1 with
+  // smoothing off, i.e. bit-exact — that is what keeps the offline check
+  // identical to the notebook.
+  let drawnFrom = source, dw = side, dh = side, dsx = sx, dsy = sy;
+
+  if (side > size * 2) {
+    const mid = size * 4;                       // 384 for size = 96
+    cropCanvas.width = cropCanvas.height = mid;
+    const midCtx = cropCanvas.getContext("2d");
+    midCtx.imageSmoothingEnabled = true;
+    midCtx.imageSmoothingQuality = "high";
+    midCtx.drawImage(source, sx, sy, side, side, 0, 0, mid, mid);
+    drawnFrom = cropCanvas;
+    dsx = dsy = 0; dw = dh = mid;
+  }
+
+  srcCtx.imageSmoothingEnabled = (dw !== size);
+  srcCtx.imageSmoothingQuality = "high";
+  srcCtx.clearRect(0, 0, size, size);
+  srcCtx.drawImage(drawnFrom, dsx, dsy, dw, dh, 0, 0, size, size);
+
+  const rgba = srcCtx.getImageData(0, 0, size, size).data;   // Row-major RGBA
+
+  // ---- 3./4./5. scale, standardise, reorder to NCHW ---------------------
+  const plane = size * size;
+  const input = new Float32Array(3 * plane);
+  const mR = INFO.mean[0], mG = INFO.mean[1], mB = INFO.mean[2];
+  const sR = INFO.std[0],  sG = INFO.std[1],  sB = INFO.std[2];
+
+  for (let i = 0; i < plane; i++) {
+    const p = i * 4;
+    input[i]            = (rgba[p]     / 255 - mR) / sR;   // plane 0 : Red
+    input[plane + i]    = (rgba[p + 1] / 255 - mG) / sG;   // plane 1 : Green
+    input[2 * plane + i]= (rgba[p + 2] / 255 - mB) / sB;   // plane 2 : Blue
+  }
+  return input;                                             // batch size 1
+}
+
+/* The model returns raw logits (no Softmax node in the graph), exactly like
+   the notebook's model(x); probabilities appear by applying softmax here. */
+function softmax(logits) {
+  const a = Array.from(logits);
+  const m = Math.max.apply(null, a);
+  let sum = 0;
+  const e = a.map((v) => { const x = Math.exp(v - m); sum += x; return x; });
+  return e.map((x) => x / sum);
+}
+
+async function classify(source, w, h) {
+  const data = preprocess(source, w, h);
+  const tensor = new ort.Tensor("float32", data, [1, 3, INFO.input_size, INFO.input_size]);
+  const results = await session.run({ [INPUT_NAME]: tensor });
+  const logits = results[session.outputNames[0]].data;      // float32[classes]
+  return softmax(logits);
+}
+
+/* =====================================================================
+   4.  Probability bars
+   ===================================================================== */
+
+function buildBars() {
+  const ul = $("bars");
+  ul.innerHTML = "";
+  INFO.classes.forEach((c) => {
+    const li = document.createElement("li");
+    li.dataset.cls = c;
+    li.innerHTML =
+      '<div class="row1"><span class="label">' + c + '</span>' +
+      '<span class="value">—</span></div>' +
+      '<div class="track"><div class="fill"></div></div>';
+    ul.appendChild(li);
+  });
+}
+
+function render(probs) {
+  const items = Array.prototype.slice.call($("bars").children);
+  const order = probs.map((p, i) => [p, i]).sort((a, b) => b[0] - a[0]);
+  items.forEach((li) => {
+    const i = INFO.classes.indexOf(li.dataset.cls);
+    li.querySelector(".value").textContent = (probs[i] * 100).toFixed(1) + " %";
+    li.querySelector(".fill").style.width = (probs[i] * 100).toFixed(2) + "%";
+    li.classList.toggle("lead", order[0][1] === i);
+  });
+  $("topName").textContent = INFO.classes[order[0][1]];
+  $("topPct").textContent  = (order[0][0] * 100).toFixed(1) + " %";
+}
+
+/* =====================================================================
+   5.  Live camera loop (Safari-on-iOS friendly)
+   ===================================================================== */
+
+const video = $("video");
+let stream = null;
+let running = false;
+let photoMode = false;      // an uploaded photo is on screen instead of the camera
+let busy = false;
+let frameHandle = null;
+let frames = 0, fpsClock = 0;
+
+async function startCamera() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    log("getUserMedia is missing — on iPhone this page must be opened over HTTPS " +
+        "(the GitHub Pages URL works, file:// does not).", "bad");
+    return;
+  }
+  $("startBtn").disabled = true;
+  log("Requesting the rear camera…");
+
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: {
+        facingMode: { ideal: "environment" },          // rear camera, fall back to front
+        width:  { ideal: 1280 },
+        height: { ideal: 1280 }                        // square-ish source = less cropping
+      }
+    });
+  } catch (e) {
+    // Retry with no constraints at all: some browsers reject the shape above.
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      log("Generic camera constraint accepted instead (" + e.name + ").", "warn");
+    } catch (e2) {
+      $("startBtn").disabled = false;
+      log("Camera refused (" + (e2.name || "?") + ": " + e2.message +
+          "). Allow access in the browser settings, or use “Upload a photo”.", "bad");
+      return;
+    }
+  }
+
+  const track = stream.getVideoTracks()[0];
+  const settings = track.getSettings ? track.getSettings() : {};
+
+  stream.getTracks().forEach((t) =>
+    t.addEventListener("ended", () => { log("Camera stream ended.", "warn"); stopCamera(); }));
+
+  video.srcObject = stream;
+  video.setAttribute("playsinline", "");
+  video.setAttribute("webkit-playsinline", "");
+
+  // leave photo mode
+  photoMode = false;
+  video.classList.remove("hidden");
+  const leftover = document.querySelector(".stage img.preview");
+  if (leftover) leftover.remove();
+
+  // Safari sometimes ignores autoplay even with the attributes set; play()
+  // again from the same user gesture and then on the first data arriving.
+  try {
+    await video.play();
+  } catch (e) {
+    await new Promise((r) => {
+      const done = () => { video.removeEventListener("loadeddata", done); r(); };
+      video.addEventListener("loadeddata", done);
+      video.play().catch(() => {});
+    });
+    try { await video.play(); } catch (e2) { /* already playing */ }
+  }
+
+  // metadata is known only once the stream really plays (Safari reports 0 before)
+  log("Camera on: " + (settings.facingMode || "rear") + ", " +
+      video.videoWidth + "×" + video.videoHeight + " — its central square is what the model sees.", "ok");
+
+  $("camHint").classList.add("hidden");
+  $("cropbox").classList.remove("hidden");
+  $("stopBtn").classList.remove("hidden");
+  $("startBtn").classList.add("hidden");
+
+  running = true;
+  frames = 0; fpsClock = performance.now();
+  loop();
+}
+
+// Prefer the video-frame callback (fires once per decoded frame); rAF elsewhere.
+function nextFrame(cb) {
+  if (video.requestVideoFrameCallback) frameHandle = video.requestVideoFrameCallback(cb);
+  else frameHandle = requestAnimationFrame(cb);
+}
+
+function loop() {
+  if (!running) return;
+  if (busy || photoMode || !session || video.readyState < 2 || !video.videoWidth) {
+    frameHandle = nextFrame(loop);
+    return;
+  }
+  busy = true;
+  const t0 = performance.now();
+  classify(video, video.videoWidth, video.videoHeight)
+    .then((probs) => {
+      render(probs);
+      frames++;
+      const now = performance.now();
+      if (now - fpsClock > 1000) {
+        $("perf").textContent = (frames * 1000 / (now - fpsClock)).toFixed(1) +
+          " inferences/s · " + Math.round(now - t0) + " ms last · " +
+          video.videoWidth + "×" + video.videoHeight + " → " +
+          INFO.input_size + "×" + INFO.input_size;
+        frames = 0; fpsClock = now;
+      }
+    })
+    .catch((e) => { log("Inference failed: " + e.message, "bad"); stopCamera(); })
+    .finally(() => { busy = false; frameHandle = nextFrame(loop); });
+}
+
+function stopCamera() {
+  running = false;
+  if (frameHandle) {
+    if (video.cancelVideoFrameCallback) video.cancelVideoFrameCallback(frameHandle);
+    else cancelAnimationFrame(frameHandle);
+    frameHandle = null;
+  }
+  if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
+  video.srcObject = null;
+  $("camHint").classList.remove("hidden");
+  $("cropbox").classList.add("hidden");
+  $("stopBtn").classList.add("hidden");
+  $("startBtn").classList.remove("hidden");
+  $("startBtn").disabled = false;
+  $("perf").textContent = "";
+  log("Camera stopped.");
+}
+
+/* =====================================================================
+   6.  Photo upload (the offline fallback)
+   ===================================================================== */
+
+let photoObjectURL = null;
+
+$("fileInput").addEventListener("change", (event) => {
+  const file = event.target.files && event.target.files[0];
+  if (file) showPhoto(file);
+  event.target.value = "";                 // allow re-picking the same file
+});
+
+function showPhoto(file) {
+  if (!session) { log("The model is still loading — try again in a second.", "warn"); return; }
+  if (photoObjectURL) URL.revokeObjectURL(photoObjectURL);
+  photoObjectURL = URL.createObjectURL(file);   // local blob: never uploaded
+  photoMode = true;                             // freeze the live loop, it would overwrite the result
+
+  const img = new Image();
+  img.onload = async () => {
+    const stage = document.querySelector(".stage");
+    stage.querySelector("video").classList.add("hidden");
+    let shown = stage.querySelector("img.preview");
+    if (!shown) {
+      shown = document.createElement("img");
+      shown.className = "preview";
+      shown.alt = "uploaded photo";
+      stage.appendChild(shown);
+    }
+    shown.src = photoObjectURL;
+    $("camHint").classList.add("hidden");
+    $("cropbox").classList.remove("hidden");
+
+    log("Photo “" + file.name + "” (" + img.naturalWidth + "×" + img.naturalHeight +
+        ") classified locally.", "ok");
+    try {
+      const probs = await classify(img, img.naturalWidth, img.naturalHeight);
+      render(probs);
+      if (/^check_image/i.test(file.name)) compareToExpected(probs);
+    } catch (e) {
+      log("Could not classify the photo: " + e.message, "bad");
+    }
+  };
+  img.onerror = () => log("That file is not a readable image.", "bad");
+  img.src = photoObjectURL;
+}
+
+/* =====================================================================
+   7.  Self-check against check_expected.json
+   ===================================================================== */
+
+let EXPECTED = null;
+
+async function fetchExpected() {
+  const r = await fetch(url(CHECK_JSON), { cache: "no-store" });
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  EXPECTED = await r.json();
+}
+
+function compareToExpected(probs) {
+  if (!EXPECTED) return;
+  const classes = INFO.classes;
+  const rows = classes.map((c, i) => {
+    const exp = EXPECTED[c], got = probs[i];
+    return { c: c, exp: exp, got: got, diff: Math.abs(got - exp) };
+  });
+  const maxDiff = Math.max.apply(null, rows.map((r) => r.diff));
+  const ok = maxDiff < 5e-4;                 // agreement to three decimals
+
+  const box = $("selfcheck");
+  box.innerHTML =
+    '<table><caption>check_image.jpg — page vs. notebook</caption>' +
+    "<thead><tr><th>class</th><th>check_expected.json</th><th>this page</th><th>|difference|</th></tr></thead><tbody>" +
+    rows.map((r) =>
+      "<tr><td>" + r.c + "</td><td>" + r.exp.toFixed(6) + "</td><td>" + r.got.toFixed(6) +
+      "</td><td>" + r.diff.toExponential(1) + "</td></tr>").join("") +
+    "</tbody></table>" +
+    '<p class="verdict ' + (ok ? "ok" : "bad") + '">' +
+      (ok ? "✔ Match — identical to at least three decimals (largest difference " +
+           maxDiff.toExponential(1) + ")."
+          : "✘ No match — largest difference " + maxDiff.toExponential(1) + ".") +
+    "</p>";
+  log("Self-check " + (ok ? "passed" : "FAILED") + " (max |diff| = " +
+      maxDiff.toExponential(2) + ")", ok ? "ok" : "bad");
+}
+
+async function runSelfCheck() {
+  if (!session) { log("Model not ready yet.", "warn"); return; }
+  if (!EXPECTED) {
+    $("selfcheck").innerHTML = '<p class="meta">check_expected.json not found next to this page.</p>';
+    return;
+  }
+  $("selfcheck").innerHTML = '<p class="meta">Decoding check_image.jpg…</p>';
+  if (location.protocol === "file:") {
+    $("selfcheck").innerHTML =
+      '<p class="meta">Opened as a local file, the browser blocks reading ' +
+      'check_image.jpg. Serve the folder (python3 -m http.server) or open the ' +
+      'hosted URL — or just upload check_image.jpg above.</p>';
+    return;
+  }
+  try {
+    const blob = await (await fetch(url(CHECK_IMAGE), { cache: "no-store" })).blob();
+    const bmp = await createImageBitmap(blob);            // same decoder path as the video
+    const probs = await classify(bmp, bmp.width, bmp.height);
+    bmp.close();
+    compareToExpected(probs);
+  } catch (e) {
+    // createImageBitmap is missing on old Safari -> fall back to <img>
+    const img = new Image();
+    img.onload = async () => {
+      try { compareToExpected(await classify(img, img.naturalWidth, img.naturalHeight)); }
+      catch (e2) { $("selfcheck").innerHTML = '<p class="meta">Check failed: ' + e2.message + "</p>"; }
+    };
+    img.src = url(CHECK_IMAGE);
+  }
+}
+
+/* =====================================================================
+   8.  QR code of the current page URL
+   ===================================================================== */
+
+let qrObject = null;
+
+function currentPageURL() {
+  // Strip a trailing index.html so the link is the clean Pages URL.
+  const u = new URL(window.location.href);
+  if (u.pathname.endsWith("/index.html")) u.pathname = u.pathname.slice(0, -"index.html".length);
+  u.hash = "";
+  return u.href;
+}
+
+function drawQR() {
+  const target = $("urlInput").value.trim();
+  const box = $("qrcode");
+  box.innerHTML = "";
+  $("urlLink").textContent = target || "—";
+  $("urlLink").href = target || "#";
+  if (!target || !window.QRCode) {
+    $("qrNote").textContent = window.QRCode
+      ? "Type the address to draw its QR code."
+      : "The QR library did not load (offline?) — the link above still works.";
+    return;
+  }
+  try {
+    qrObject = new QRCode(box, {
+      text: target,
+      width: 172, height: 172,
+      colorDark: "#0f1a14", colorLight: "#ffffff",
+      correctLevel: QRCode.CorrectLevel.M
+    });
+    $("qrNote").textContent = "Scans to: " + target;
+  } catch (e) {
+    $("qrNote").textContent = "QR could not be drawn: " + e.message;
+  }
+}
+
+$("useCurrentBtn").addEventListener("click", () => {
+  $("urlInput").value = currentPageURL();
+  drawQR();
+});
+$("urlInput").addEventListener("input", () => { clearTimeout(drawQR._t); drawQR._t = setTimeout(drawQR, 250); });
+$("copyBtn").addEventListener("click", async () => {
+  const v = $("urlInput").value.trim();
+  try { await navigator.clipboard.writeText(v); $("qrNote").textContent = "Link copied."; }
+  catch (e) { $("qrNote").textContent = "Copy blocked — select the address and copy it."; }
+});
+
+/* =====================================================================
+   9.  Boot
+   ===================================================================== */
+
+$("startBtn").addEventListener("click", startCamera);
+$("stopBtn").addEventListener("click", stopCamera);
+$("checkBtn").addEventListener("click", runSelfCheck);
+document.addEventListener("visibilitychange", () => {   // release the camera when hidden
+  if (document.hidden && running) stopCamera();
+});
+
+window.addEventListener("pagehide", () => {             // iOS: free the LED / camera
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+});
+
+(async function boot() {
+  $("urlInput").value = currentPageURL();
+  buildBars();
+
+  loadFirst(QR_CANDIDATES, "qrcode.js").then(drawQR).catch(() => drawQR());
+
+  try {
+    await loadModelInfo();
+    buildBars();
+    await loadModel();
+    $("checkBtn").disabled = false;
+    fetchExpected()
+      .then(() => runSelfCheck())
+      .catch(() => { $("selfcheck").innerHTML =
+        '<p class="meta">check_expected.json not found next to this page — ' +
+        'the comparison table needs it.</p>'; });
+  } catch (e) {
+    log("Startup problem: " + e.message, "bad");
+  }
+})();
+</script>
+</body>
+</html>
