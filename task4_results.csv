@@ -1,0 +1,17 @@
+Variant,Seed,Val Acc (%),Camera-like Val Acc (%),Notes / Observations
+baseline Task 3,42,67.7,51.6,network from scratch, geometric aug, Adam 1e-3, 15 epochs
+A1 + ColorJitter,42,67.7,61.8,A1: colours jittered as well
+A2 pretrained frozen,42,77.4,70.4,A2: MobileNet features frozen, only the head trains
+A3 pretrained finetune,42,87.1,78.0,A3: the whole MobileNet trains, lr 1e-4
+A4 + AdamW + cosine,42,72.6,77.4,A4: AdamW + cosine over 40 epochs
+A5a + dropout 0.3,42,62.9,52.2,A5: dropout 0.3 on the 64 hidden values
+A5b + best epoch,42,67.7,51.6,A5: weights of the epoch with the lowest val loss; best epoch 15
+combo A1+A4+A5b,42,79.0,83.3,the changes that helped, put together; best epoch 26
+baseline Task 3,123,74.2,53.8,network from scratch, geometric aug, Adam 1e-3, 15 epochs
+baseline Task 3,999,69.4,53.2,network from scratch, geometric aug, Adam 1e-3, 15 epochs
+combo A1+A4+A5b,123,83.9,84.9,the changes that helped, put together; best epoch 24
+combo A1+A4+A5b,999,77.4,82.8,the changes that helped, put together; best epoch 25
+A3 pretrained finetune,123,83.9,81.7,A3: the whole MobileNet trains, lr 1e-4
+A3 pretrained finetune,999,82.3,76.3,A3: the whole MobileNet trains, lr 1e-4
+A6 scratch + history,42,79.0,63.4,A6: baseline net, +700 historical images in train
+A6 finetune + history,42,79.0,82.8,A6: A4 recipe, +700 historical images in train; best epoch 24
